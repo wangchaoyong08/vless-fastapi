@@ -4,10 +4,16 @@ import struct
 import asyncio
 import uuid
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Response
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Response, Header
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from typing import Optional, Tuple, Dict, Any
 import ipaddress
+from tenacity import (
+    retry,
+    stop_after_attempt,  # 重试次数限制
+    wait_exponential,  # 指数退避（1s→2s→4s）
+    retry_if_exception_type,  # 按异常类型重试
+)
 
 app = FastAPI()
 
@@ -51,14 +57,12 @@ class UUIDUtil:
 class VlessParser:
     @staticmethod
     def parse(buffer: bytes, user_id: str) -> Dict[str, Any]:
-        print(buffer)
         if len(buffer) < 24:
             return {"error": "Invalid VLESS header"}
 
         version = buffer[0]
         uuid_buf = buffer[1:17]
         parsed_uuid = UUIDUtil.format(uuid_buf)
-
 
         if parsed_uuid != user_id:
             return {"error": "Invalid UUID"}
@@ -161,21 +165,47 @@ class NAT64Resolver:
 
 # DNS UDP处理
 class DNSOutbound:
+    dns_index = 0
+    dns_servers = [
+        "1.1.1.1",
+        "1.0.0.1",
+        "223.5.5.5"  # 阿里云
+    ]
+
+    @classmethod
+    @retry(
+        stop=stop_after_attempt(3),
+        retry=retry_if_exception_type((
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                httpx.HTTPStatusError
+        )),
+        reraise=True  # 重试失败后抛出原异常（便于外层捕获）
+    )
+    async def dns_query(cls, client: httpx.AsyncClient, chunk: bytes):
+
+        resp = await client.post(
+            f"https://{cls.dns_servers[cls.dns_index]}/dns-query",
+            headers={"content-type": "application/dns-message"},
+            content=chunk
+        )
+        resp.raise_for_status()
+        content = resp.content
+
+        cls.dns_index += 1
+        if cls.dns_index > len(cls.dns_servers) - 1:
+            cls.dns_index = 0
+        return content
+
     @staticmethod
     async def create(websocket: WebSocket, header: bytes):
         sent = False
 
         async def write(chunk: bytes):
             nonlocal sent
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=3.0) as client:
                 try:
-                    resp = await client.post(
-                        "https://1.1.1.1/dns-query",
-                        headers={"content-type": "application/dns-message"},
-                        content=chunk
-                    )
-                    resp.raise_for_status()
-                    buf = resp.content
+                    buf = await DNSOutbound.dns_query(client, header)
                     size = struct.pack("!H", len(buf))
 
                     if not sent:
@@ -198,7 +228,7 @@ class Pipe:
         sent = False
         try:
             while True:
-                chunk = await reader.read(4096)
+                chunk = await reader.read(500 * 1024)  # TODO 4096改成500k
                 if not chunk:
                     break
                 # 正确的WebSocket连接状态判断
@@ -210,12 +240,14 @@ class Pipe:
                     else:
                         await websocket.send_bytes(chunk)
                 else:
-                    break
+                    raise RuntimeError("WebSocket connection is not open")
         except Exception as e:
             print(f"Pipe error: {e}")
-        finally:
-            if websocket.client_state.value == WS_READY_STATE_OPEN:
-                await websocket.close()
+        # finally:
+        #     try:
+        #         await websocket.close()
+        #     except Exception as e:
+        #         print(f"Safe close websocket error: {e}")
 
 
 # VLESS会话处理
@@ -300,8 +332,8 @@ class VlessSession:
         self.is_DNS = False
 
         # 关闭WebSocket连接
-        if self.websocket.client_state.value == WS_READY_STATE_OPEN:
-            await self.websocket.close()
+        # if self.websocket.client_state.value == WS_READY_STATE_OPEN:
+        #     await self.websocket.close()
 
 
 # 订阅生成器
@@ -441,22 +473,109 @@ proxies:
         return json.dumps(sb_config, indent=2, ensure_ascii=False)
 
 
-# WebSocket处理端点
-@app.websocket("/{path:path}")
-async def websocket_endpoint(websocket: WebSocket, path: str):
+@app.websocket("/ws/{path:path}")
+async def websocket_endpoint2(websocket: WebSocket, path: str):
     await websocket.accept()
-    session = VlessSession(config, websocket)
+    while True:
+        data = ""
+        data = await websocket.receive()
+        print(data)
+
+
+# 新增：通用的 WS 消息接收函数（兼容分帧/掩码/文本/二进制）
+async def receive_websocket_message(websocket: WebSocket):
+    """
+    接收完整的 WebSocket 消息（处理分帧、掩码）
+    返回：完整的字节数据
+    """
+    message = await websocket.receive()
+    if message["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(message["code"])
+
+    # 处理文本消息：转字节
+    if "text" in message:
+        return message["text"].encode("utf-8", errors="ignore")
+
+    # 处理二进制消息（核心：自动解掩码）
+    elif "bytes" in message:
+        return message["bytes"]
+
+    # 处理其他类型（如 ping/pong）
+    else:
+        return b""
+
+
+def parse_early_data_from_header(sec_websocket_protocol: str = Header(None)) -> bytes:
+    """
+   解析v2rayN的sec-websocket-protocol头：
+   1. 处理base64编码的早数据
+   2. 过滤开头无效字节（\x00\x01等）
+   3. 返回纯HTTP数据字节
+   """
+    early_data = b""
+    if not sec_websocket_protocol:
+        return early_data
 
     try:
-        # 处理WebSocket消息
+
+        clean_str = sec_websocket_protocol.replace('-', '+').replace('_', '/')
+
+        # 步骤3：Base64解码（此时字符数是4的倍数）
+        decoded = base64.b64decode(clean_str, validate=False)
+
+        # 步骤4：过滤无效字节（只保留可打印的HTTP字符）
+        # 保留ASCII 32-126（空格到~），过滤\x00-\x1f等占位符
+        valid_bytes = bytes([b for b in decoded if 32 <= b <= 126])
+
+        return valid_bytes
+    except Exception as e:
+        print(f"早数据解码失败：{e}")
+        return b""
+
+
+# WebSocket处理端点
+@app.websocket("/{path:path}")
+async def websocket_endpoint(websocket: WebSocket, path: str, sec_websocket_protocol: str = Header(None)):
+    # 1. 解析早数据
+    early_data = parse_early_data_from_header(sec_websocket_protocol)
+
+    # 2. 提取子协议，完成WS握手（兼容v2rayN的子协议格式）
+    sub_protocol = ""
+    if sec_websocket_protocol:
+        sub_protocol = sec_websocket_protocol.split(";")[0].strip()
+
+    # 3. 接受WS连接，回复子协议（关键：兼容v2ray的协议协商）
+    await websocket.accept(subprotocol=sub_protocol if sub_protocol else None)
+    session = VlessSession(config, websocket)
+    # websocket.
+
+    try:
+        # 4. 优先处理早数据（早数据是v2rayN先发的核心数据，丢失会导致数据不全）
+        if early_data:
+            print(f"✅ 从sec-websocket-protocol提取早数据：长度 {len(early_data)}")
+            await session.on_data(early_data)
+
+        # 5. 处理后续WS帧数据
         while True:
-            data = await websocket.receive_bytes() # await
-            await session.on_data(data)
+            # data = await websocket.receive_bytes()  # v2rayN「分帧发送」，不是「一次性发完整帧」
+            # 接收数据
+            data = await websocket.receive()
+            print(data)
+            if data["type"] == "websocket.disconnect":
+                raise WebSocketDisconnect()
+            if "text" in data:
+                text_data = data["text"]
+                # 处理文本数据（可能是配置信息或特殊指令）
+                # await handle_text_data(text_data, websocket)
+            elif "bytes" in data:
+                binary_data = data["bytes"]
+                await session.on_data(binary_data)
     except WebSocketDisconnect:
         print("WebSocket disconnected normally")
         await session.cleanup()
     except Exception as e:
         print(f"WebSocket error: {e}")
+    finally:
         try:
             await websocket.close(code=1011, reason=str(e))
         except:
